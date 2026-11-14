@@ -178,6 +178,7 @@ h1,h2,h3{margin:0;font-weight:800}
 .stat{display:inline-block;font-size:12px;background:rgba(255,255,255,.1);border-radius:8px;padding:2px 7px;margin:2px}
 /* ---------- 会話 ---------- */
 #talk{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);width:min(820px,92vw);padding:18px 24px 16px;z-index:35}
+.talkback{position:absolute;inset:0;z-index:48;background:rgba(5,10,30,.4)}
 #talk .who{position:absolute;top:-22px;left:26px;background:var(--gold);color:#3a2400;border-radius:12px;padding:4px 16px;font-weight:900;font-size:18px}
 #talk .txt{font-size:22px;line-height:1.6;min-height:72px}
 #talk .ch{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end;margin-top:8px}
@@ -4470,7 +4471,16 @@ const UI = {
       G.allowMove = false;
       let i = 0;
       const box = el('div', { id: 'talk', class: 'panel rope' }, el('div', { class: 'who' }, who), el('div', { class: 'txt' }), el('div', { class: 'ch' }), el('div', { class: 'next' }, '▼'));
-      $('#modalRoot').append(box);
+      // メニューや水槽の画面の上で話しかけられたときは、その画面より手前に出す（奥にかくれて選べなくならないように）
+      // （タイトル画面・アカウントの小窓の上でも同じ。うしろの画面を うっかりタップしないよう、うすい幕でおおう）
+      const over = $$('#modalRoot .modal').pop() || null;
+      const covers = [...$$('#modalRoot .modal'), ...$$('#title')];
+      let wrap = null;
+      if (covers.length) {
+        wrap = el('div', { class: 'talkback' }, box);
+        wrap.style.zIndex = Math.max(48, ...covers.map(e => (parseInt(getComputedStyle(e).zIndex, 10) || 0) + 1));
+      }
+      $('#modalRoot').append(wrap || box);
       const txt = box.querySelector('.txt'), ch = box.querySelector('.ch'), nx = box.querySelector('.next');
       let typing = null;
       const show = () => {
@@ -4485,7 +4495,8 @@ const UI = {
         ch.innerHTML = '';
         for (const [label, val] of choices) ch.append(el('button', { class: 'btn' + (val === false ? '' : ' turq'), onclick: (e) => { e.stopPropagation(); finish(val); } }, label));
       };
-      const finish = (v) => { clearInterval(typing); box.remove(); G.allowMove = true; Audio2.sfx('ui'); done(v); };
+      // メニュー・お店の画面がまだ開いているなら、動けないままにしておく（閉じたときに動けるようになる）
+      const finish = (v) => { clearInterval(typing); (wrap || box).remove(); G.allowMove = !(over && over.isConnected && over.dataset.hold); Audio2.sfx('ui'); done(v); };
       box.addEventListener('pointerdown', (e) => {
         if (e.target.closest('button')) return;
         if (typing) { clearInterval(typing); typing = null; txt.textContent = lines[i]; if (i === lines.length - 1 && choices) showChoices(); return; }
@@ -4514,7 +4525,7 @@ const Menu = {
         el('button', { class: 'btn', onclick: () => { this.close(); Social.ranking(); } }, '🏆 ランキング'),
         el('button', { class: 'btn', onclick: () => this.close() }, '✕ 閉じる')),
       tabBar, body);
-    this.el = el('div', { class: 'modal' }, win);
+    this.el = el('div', { class: 'modal', 'data-hold': '1' }, win);
     $('#modalRoot').append(this.el);
     this.render(tab, body);
   },
@@ -5641,7 +5652,7 @@ const Shop = {
     const body = el('div', { class: 'scroll' });
     const money = el('div', { class: 'chip', style: 'pointer-events:none' }, el('span', { class: 'coin' }, 'G'), el('span', {}, fmt(S.prog.money)));
     const win = el('div', { class: 'win panel rope' }, el('div', { class: 'head' }, el('h2', {}, title), money, el('button', { class: 'btn', onclick: () => close() }, '✕ 閉じる')), body);
-    const m = el('div', { class: 'modal' }, win);
+    const m = el('div', { class: 'modal', 'data-hold': '1' }, win);
     $('#modalRoot').append(m);
     const refresh = () => { body.innerHTML = ''; money.lastChild.textContent = fmt(S.prog.money); build(body, refresh); };
     const close = () => { m.remove(); G.allowMove = true; Audio2.sfx('ui'); Game.save(); };
@@ -6742,29 +6753,48 @@ const Aquarium = {
 
 // ------------------------------------------------------------------ 見せびらかす（あつ森のように、魚を出して頭の上にかかげる）
 const ShowOff = {
-  busy: false,
+  busy: false, net: null, seq: 0,
+  // 魚を頭の上にのせて、「見て！」の札を出す（自分も、オンラインのほかの人も これを使う）
+  async attach(root, entry) {
+    const c = Aquarium.entryCatch(entry);
+    if (!c.data) return null;
+    if (!c.rarity) c.rarity = RARITY[c.data.r] ? c.data.r : 'C';
+    const real = entry.kind === 'fish' ? entry.len : (c.data.len || 2);
+    const want = clamp(real, 0.45, 1.5);
+    const o = await makeCatchObj(c, want / real);
+    const holder = new THREE.Group();
+    holder.position.set(0, 1.32 + want * 0.17, 0.1);   // 頭のすぐ上（腕が短いので、頭の上にのせて掲げる形）
+    o.rotation.set(0, Math.PI / 2, 0);   // 体の横を見せる
+    holder.add(o);
+    root.add(holder);
+    const special = !!((entry.v && entry.v.gold) || entry.kind === 'legend');
+    const sign = stallSign(`見て！ ${catchName(c)} ${fmtLen(entry.len)}`, special ? '#e0a020' : '#ff7a3a');
+    sign.scale.multiplyScalar(0.8);
+    sign.position.set(0, 2.25 + want * 0.4, 0);
+    sign.userData.base = sign.scale.clone(); sign.userData.y0 = sign.position.y;
+    root.add(sign);
+    return { holder, sign, mixer: o.userData.mixer || null, want, special, c };
+  },
+  detach(sh) {
+    if (!sh) return;
+    sh.holder.removeFromParent(); sh.sign.removeFromParent();
+    if (sh.mixer) Mixers.list.delete(sh.mixer);
+  },
   async start(entry) {
     if (this.busy) return;
     if (Player.mode !== 'walk' || Fishing.active) { UI.note('歩いているときに見せびらかせるよ'); return; }
     this.busy = true;
     G.allowMove = false;
     Player.vel.set(0, 0, 0);
-    const c = Aquarium.entryCatch(entry);
-    const real = entry.kind === 'fish' ? entry.len : (c.data.len || 2);
-    const want = clamp(real, 0.45, 1.5);
-    const o = await makeCatchObj(c, want / real);
+    const v = entry.v || {};
+    // オンライン：何を見せびらかしているかを位置といっしょに送る（ほかの人の画面でも頭の上に魚が出る）
+    this.net = [entry.kind, entry.id, Math.round((entry.len || 0) * 1000) / 1000, (v.gold ? 1 : 0) | (v.shiny ? 2 : 0) | (v.dark ? 4 : 0), ++this.seq];
     const ch = Player.ch;
+    let sh = null;
+    try { sh = await this.attach(ch.root, entry); } catch (e) { console.warn('showoff', e); }
+    if (!sh) { this.busy = false; this.net = null; G.allowMove = true; return; }
     ch.play('lift', 0.2);
-    const holder = new THREE.Group();
-    holder.position.set(0, 1.32 + want * 0.17, 0.1);   // 頭のすぐ上（腕が短いので、頭の上にのせて掲げる形）
-    o.rotation.set(0, Math.PI / 2, 0);   // 体の横を見せる
-    holder.add(o);
-    ch.root.add(holder);
-    const special = (entry.v && entry.v.gold) || entry.kind === 'legend';
-    const bubble = stallSign(`見て！ ${catchName(c)} ${fmtLen(entry.len)}`, special ? '#e0a020' : '#ff7a3a');
-    bubble.scale.multiplyScalar(0.8);
-    bubble.position.set(0, 2.25 + want * 0.4, 0);
-    ch.root.add(bubble);
+    const { want, special, c } = sh;
     // カメラは前から（大きい魚ほど少し引いて、吹き出しまで入るように）
     const p = Player.pos, yaw = Player.yaw;
     const fx = Math.sin(yaw), fz = Math.cos(yaw);
@@ -6776,8 +6806,8 @@ const ShowOff = {
     if (special) { Particles.confetti(top.x, top.y + 0.5, top.z); UI.flash('#ffe39a', 0.35); }
     UI.note(`${catchName(c)}（${fmtLen(entry.len)}）を見せびらかした！`, special ? 'gold' : '');
     await new Promise(r => setTimeout(r, 3800));
-    holder.removeFromParent(); bubble.removeFromParent();
-    this.busy = false; G.allowMove = true;
+    this.detach(sh);
+    this.busy = false; this.net = null; G.allowMove = true;
     ch.play('idle', 0.3);
   },
 };
@@ -7292,7 +7322,7 @@ const Net = {
     }
     if (Boat.obj) s.b = [Boat.id, r2(Boat.pos.x), r2(Boat.pos.z), r2(Boat.yaw), Skins.boatSkin(Boat.id) || '', Game.boatColor(Boat.id), Game.boatSail(Boat.id)];
     if (Ride.on) s.r = [Ride.owner, Ride.seat];
-    if (ShowOff.busy) s.a = 'lift';
+    if (ShowOff.busy) { s.a = 'lift'; if (ShowOff.net) s.sh = ShowOff.net; }   // 見せびらかしている魚 [種類, id, 長さ, 金1|色違い2|闇4, 番号]
     return s;
   },
   update(dt) {
@@ -7447,7 +7477,7 @@ const Others = {
   reset() { for (const id of [...this.map.keys()]) this.remove(id); },
   add(p) {
     if (!p || p.id === Net.id || this.map.has(p.id)) return;
-    const o = { id: p.id, name: p.name, look: p.look || {}, title: p.title || '', snaps: [], last: null, ch: null, boat: null, boatKey: '', rod: null, rodKey: '', bob: null, line: null, ride: p.ride || null, bubble: null, anim: '' };
+    const o = { id: p.id, name: p.name, look: p.look || {}, title: p.title || '', snaps: [], last: null, ch: null, boat: null, boatKey: '', rod: null, rodKey: '', bob: null, line: null, ride: p.ride || null, bubble: null, anim: '', show: null, showKey: '', showNoteT: 0 };
     this.map.set(p.id, o);
     if (p.st) this.state(p.id, p.st);
     this.build(o);
@@ -7465,6 +7495,8 @@ const Others = {
     o.anim = '';
     if (o.rod) { o.rod.removeFromParent(); o.rod = null; o.rodKey = ''; }
     if (o.bubble) { o.bubble.removeFromParent(); o.bubble = null; }
+    if (o.show) { ShowOff.detach(o.show); o.show = null; }
+    o.showKey = '';   // 見せびらかし中なら、新しい体にもう一度のせる
   },
   setLook(id, look, title) { const o = this.map.get(id); if (!o) return; o.look = look || {}; o.title = title || ''; this.build(o); },
   remove(id) {
@@ -7472,6 +7504,8 @@ const Others = {
     if (!o) return;
     this.map.delete(id);
     for (const k of ['boat', 'bob', 'line']) if (o[k]) o[k].removeFromParent();
+    if (o.show) { ShowOff.detach(o.show); o.show = null; }
+    o.showKey = 'gone';
     if (o.ch) o.ch.root.removeFromParent();
     if (Ride.on && Ride.owner === id) Ride.stop('船の持ち主がいなくなったので降りた');
   },
@@ -7568,12 +7602,48 @@ const Others = {
       // 遠くても名札と吹き出しが読めるように、少しずつ大きくする
       const ks = clamp(d / 10, 1, 2.6);
       if (o.tag) o.tag.scale.set(1.5 * ks, 0.525 * ks, 1);
-      if (o.bubble) { const b0 = o.bubble.userData.base || (o.bubble.userData.base = o.bubble.scale.clone()); o.bubble.scale.set(b0.x * ks, b0.y * ks, 1); o.bubble.position.y = 1.98 + (ks - 1) * 0.35; }
+      if (o.bubble) { const b0 = o.bubble.userData.base || (o.bubble.userData.base = o.bubble.scale.clone()); o.bubble.scale.set(b0.x * ks, b0.y * ks, 1); o.bubble.position.y = (o.show ? o.show.sign.userData.y0 + 0.75 : 1.98) + (ks - 1) * 0.35; }
       const an = b.a || 'idle';
       if (an !== o.anim) { o.anim = an; o.ch.play(an, 0.25); }
       o.ch.update(dt);
       this.updateFishing(o, b);
+      this.updateShow(o, b);
+      if (o.show) { const sg = o.show.sign, b0 = sg.userData.base; sg.scale.set(b0.x * ks, b0.y * ks, 1); sg.position.y = sg.userData.y0 + (ks - 1) * 0.35; }
     }
+  },
+  // 見せびらかしている人：頭の上に魚と「見て！」の札（自分の画面と同じ見た目）
+  updateShow(o, s) {
+    const sh = Array.isArray(s.sh) && s.sh.length >= 5 ? s.sh : null;
+    const key = sh ? sh.join('|') : '';
+    if (key === o.showKey) return;
+    o.showKey = key;
+    if (o.show) { ShowOff.detach(o.show); o.show = null; if (o.tag) o.tag.visible = true; }
+    if (!sh) return;
+    const kind = String(sh[0]), id = String(sh[1]), len = Number(sh[2]) || 0, f = Number(sh[3]) || 0;
+    if (!['fish', 'lord', 'giant', 'dark', 'legend', 'ragnarok'].includes(kind)) return;
+    const d = dexData(kind, id);
+    if (!d || !d.name) return;
+    const entry = { kind, id, len, v: { gold: !!(f & 1), shiny: !!(f & 2), dark: !!(f & 4) } };
+    const ch = o.ch;
+    ShowOff.attach(ch.root, entry).then(r => {
+      if (!r) return;
+      if (o.showKey !== key || o.ch !== ch || this.map.get(o.id) !== o) { ShowOff.detach(r); return; }
+      o.show = r;
+      if (o.tag) o.tag.visible = false;   // 名札は魚とかさなるので、見せびらかしている間はかくす
+      // 近くにいたら、きらきら＋お知らせ（同じ人のお知らせは20秒に1回まで）
+      if (o.dist < 60) {
+        const wp = ch.root.getWorldPosition(new THREE.Vector3());
+        Particles.sparkle(wp.x, wp.y + 2.2, wp.z, r.special ? 0xffd447 : 0xffffff, 24, 0.9);
+        if (r.special) Particles.confetti(wp.x, wp.y + 2.7, wp.z);
+        const t = performance.now();
+        if (t - o.showNoteT > 20000) {
+          o.showNoteT = t;
+          const msg = `👀 ${o.name}さんが ${catchName(r.c)}（${fmtLen(len)}）を見せびらかしている！`;
+          Chat.system(msg); UI.note(msg, r.special ? 'gold' : '');
+          Audio2.sfx(r.special ? 'fanfare' : 'talk');
+        }
+      }
+    }).catch(e => console.warn('showoff', e));
   },
   // 釣り中の人：手に竿、水面にウキ、竿先からウキまで糸
   updateFishing(o, s) {
