@@ -3354,7 +3354,9 @@ const Shadows = {
         s.speed = damp(s.speed, Math.min(base * 0.8, d * 1.5 + 0.2), 3, dt);
         fwd(s.speed);
         // 近くまで来たら頭をウキに合わせる（大きい影は小回りが利かないため）
-        if (d < thr * 4) { const k = 1 - Math.exp(-2.5 * dt); s.pos.x += (b.x - hx) * k; s.pos.z += (b.z - hz) * k; }
+        // ラグナロクは体の上のどこに投げても来るので、遠くからでも頭をウキへゆっくり寄せる
+        const rag = s.c.kind === 'ragnarok';
+        if (d < thr * 4 || rag) { const k = 1 - Math.exp(-(rag ? 0.9 : 2.5) * dt); s.pos.x += (b.x - hx) * k; s.pos.z += (b.z - hz) * k; }
         if (d < thr || s.apT > (s.big ? 9 : 6)) { s.state = 'nibble'; s.apT = 0; s.nib = s.big ? randi(1, 2) : randi(0, 3); s.nibT = rand(0.7, 1.5); s.speed = 0; }
         if (Fishing.state !== 'wait') this.release(s);
         break;
@@ -3393,15 +3395,20 @@ const Shadows = {
   // 投げた所に気づく影を選ぶ
   onCast(pt, quiet) {
     if (Paradise.here) return Paradise.onCast(pt);   // 極楽：投げたら（1回きり）極楽の魚影がかならず寄ってくる
-    let best = null, bestD = 1e9, lordMsg = null;
+    let best = null, bestD = 1e9, lordMsg = null, ragMiss = false;
     const endBait = S.prog.bait === 'bait_end';      // 終焉のエサには、ラグナロクしか食いつかない
     for (const s of this.list) {
       if (s.state !== 'swim' || s.a < 0.5) continue;
       if (endBait && s.c.kind !== 'ragnarok') continue;
       const head = s.len * 0.42;
       const hx = s.pos.x + Math.sin(s.yaw) * head, hz = s.pos.z + Math.cos(s.yaw) * head;
-      const d = Math.hypot(pt.x - hx, pt.z - hz);
-      if (d > s.noticeR) continue;
+      let d = Math.hypot(pt.x - hx, pt.z - hz);
+      if (s.c.kind === 'ragnarok') {
+        // ラグナロクは体が300mもあるので、頭だけでなく「大渦の中・体の上」ならどこに投げても気づく
+        const dBody = Math.hypot(pt.x - s.pos.x, pt.z - s.pos.z), dVortex = Math.hypot(pt.x - STORM_WALL.x, pt.z - STORM_WALL.z);
+        if (dBody < s.len * 0.5 || dVortex < 80) d = Math.min(d, dBody, dVortex);
+        else if (d > s.noticeR) { ragMiss = true; continue; }
+      } else if (d > s.noticeR) continue;
       // 真上に落とすと驚いて逃げる（主以外）
       if (!s.big && Math.hypot(pt.x - s.pos.x, pt.z - s.pos.z) < s.len * 0.3 + 0.2 && Math.random() < 0.45) { this.flee(s); UI.fishMsg('驚いて逃げた！', '#9fd8ff', true); continue; }
       // 主のエサ
@@ -3418,7 +3425,13 @@ const Shadows = {
       const prio = d - (s.big ? 100 : 0);
       if (prio < bestD) { bestD = prio; best = s; }
     }
-    if (endBait && !best && !lordMsg && !quiet) lordMsg = '終焉のエサには、ラグナロクしか食いつかない…（暗黒大陸の中心の大渦へ）';
+    if (endBait && !best && !lordMsg && !quiet) {
+      // 終焉のエサで何も寄ってこないとき：いまの場所に合わせて、どうすればいいかを教える
+      const rag = this.list.find(s => s.c.kind === 'ragnarok' && s.state !== 'gone');
+      if (rag && rag.a < 0.5) lordMsg = '大渦の底で、何かがゆっくり浮かんでくる…。少し待ってから、大渦の中に投げよう';
+      else if (rag && ragMiss) lordMsg = '終焉のエサには、ラグナロクしか食いつかない…。赤い目が光る大渦の中（ラグナロクの体の上）に投げよう';
+      else if (!rag) lordMsg = '終焉のエサには、ラグナロクしか食いつかない…（暗黒大陸の中心の大渦へ）';
+    }
     if (lordMsg && !best && !quiet) UI.note(lordMsg);
     if (best) {
       const rod = ROD_BY_ID[S.prog.rod];
