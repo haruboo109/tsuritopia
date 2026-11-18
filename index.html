@@ -3761,6 +3761,8 @@ const Fishing = {
       hookX: this.bobber.position.x, hookZ: this.bobber.position.z, lastWater: [this.bobber.position.x, this.bobber.position.z],
       reverse: 0, freeze: 0, biteChk: false, hypno: 0, nextAtk: rand(2, 4), drift: 0, eyes: false, mashN: 0, final: false,
       boss, maxStrain: boss ? 6 : 3,
+      // ラグナロク：7つの目の演出（画面がまっ暗になる約5.6秒）が終わるまで、ダイヤルも特殊攻撃も出さない
+      intro: c.kind === 'ragnarok' ? 5.4 : 0,
     };
     this.state = 'fight';
     this.bobber.visible = false;
@@ -3849,7 +3851,9 @@ const Fishing = {
     f.t += dt;
     const rod = ROD_BY_ID[S.prog.rod];
     if (f.lord) LordFx.update(f, dt);
-    if (f.final) {
+    if (f.intro > 0) {
+      f.intro -= dt;   // 登場の演出中：何も出さずに待つ（演出が終わってから、少しあけて最初のダイヤル）
+    } else if (f.final) {
       // 最後の一本釣り：ダイヤルは出さず、連打した分だけ引き上げる（外れも糸の傷もなし）
       if (Input.isDown('fish')) {
         f.prog += f.boss ? 1 / 36 : 1 / 30; Audio2.sfx('reel1'); Cam.addShake(0.35);
@@ -4182,6 +4186,7 @@ const LordFx = {
     const c = f.c;
     const ls = W.uni.water.uLordShadow.value;
     ls.set(f.pos.x, f.pos.z, Math.min(60, (c.data.len || 10) * 0.5), 0.6);
+    if (f.intro > 0) return;   // 登場の演出中は攻撃しない
     f.nextAtk -= dt;
     if (f.nextAtk <= 0 && !f.chk) {
       f.nextAtk = f.boss ? rand(5, 7.5) / (1 + (f.phase - 1) * 0.3) : rand(6, 9) / (1 + (f.phase - 1) * 0.25);
