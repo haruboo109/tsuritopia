@@ -307,6 +307,7 @@ const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t
 const rand = (a = 0, b = 1) => a + Math.random() * (b - a);
 const randi = (a, b) => Math.floor(rand(a, b + 1));
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const shuffle = (arr) => { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; };
 const damp = (cur, target, k, dt) => lerp(cur, target, 1 - Math.exp(-k * dt));
 const angWrap = (a) => { while (a > Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; };
 const angDamp = (cur, target, k, dt) => cur + angWrap(target - cur) * (1 - Math.exp(-k * dt));
@@ -3750,20 +3751,23 @@ const Fishing = {
     let over = clamp(Math.pow(Math.max(c.kg, 0.01) / rod.power, 0.3), 1, 3);
     if (lordish && rod.lordBonus) over = Math.max(1, over * 0.6);
     if (c.kind === 'ragnarok' && S.prog.rod !== 'shuen' && S.prog.rod !== 'wadatsumi') over = 3;
-    // 隠しボス：いちばんむずかしい（針が速い・白いところがせまい・ワナが多い・糸の傷は治らない・6回で切れる）
+    // 隠しボス：いちばんむずかしい（針がいちばん速い・白いところがいちばんせまい・お邪魔をぜんぶ使う・糸の傷は治らない・3回で切れる）
     const boss = c.kind === 'boss';
     let diff = rIdx * 0.55 + (over - 1) * 1.3 + (lordish ? 0.8 : 0) + (c.kind === 'ragnarok' ? 0.8 : 0);
     if (boss) diff = Math.max(diff, 4.0);
     const f = this.fight = {
       c, shadow, lord: lordish, phases: lordish ? 3 : 1, phase: 1, prog: 0, strain: 0, combo: 0, greats: 0,
-      need: boss ? 11 : lordish ? (c.kind === 'ragnarok' ? 12 : 10) : 5 + rIdx * 0.8, diff, over, gap: 0.9, chk: null, t: 0,
+      need: boss ? BOSS_FIGHT.need : lordish ? (c.kind === 'ragnarok' ? 12 : 10) : 5 + rIdx * 0.8, diff, over, gap: 0.9, chk: null, t: 0,
       dist0: (lordish ? (boss ? 70 : 60) : 12 + rIdx * 4) + this.bobber.position.distanceTo(Player.head()), pos: this.bobber.position.clone(),
       hookX: this.bobber.position.x, hookZ: this.bobber.position.z, lastWater: [this.bobber.position.x, this.bobber.position.z],
       reverse: 0, freeze: 0, biteChk: false, hypno: 0, nextAtk: rand(2, 4), drift: 0, eyes: false, mashN: 0, final: false,
-      boss, maxStrain: boss ? 6 : 3,
+      boss, maxStrain: 3,
       // ラグナロク：7つの目の演出（画面がまっ暗になる約5.6秒）が終わるまで、ダイヤルも特殊攻撃も出さない
-      intro: c.kind === 'ragnarok' ? 5.4 : 0,
+      // 隠しボス：3つの頭の目が光る演出（約3.4秒）のあいだも同じ
+      intro: c.kind === 'ragnarok' ? 5.4 : boss ? 3.4 : 0,
+      bossSpd: 0, deck: null, eyesN: 0, multiK: 0, driftT: 0, quakeT: 0, grab: null,
     };
+    if (boss) f.nextAtk = rand(2.5, 3.5);   // 登場の演出が終わってから数える
     this.state = 'fight';
     this.bobber.visible = false;
     UI.fishState('fight', f);
@@ -3773,6 +3777,7 @@ const Fishing = {
     Audio2.sfx('reelStart');
   },
   newCheck(f) {
+    if (f.boss) return this.bossCheck(f);
     const rod = ROD_BY_ID[S.prog.rod];
     const d = f.diff + (f.phase - 1) * 0.6;
     const ch = { a: 0, dir: 1, speed: clamp(180 + d * 28, 170, 400), zones: [], red: [], moving: 0, done: 0, hits: 0, t: 0, frozen: false, bite: false };
@@ -3803,11 +3808,111 @@ const Fishing = {
       const lit = randi(0, 6);
       for (let i = 0; i < 7; i++) { const s = 60 + i * 42; (i === lit ? ch.zones : ch.red).push({ s, l: 22 }); }
     }
+    this.showCheck(f, ch);
+  },
+  showCheck(f, ch) {
     if (ch.dir < 0) ch.a = 360;
     for (const z of ch.zones) z.g = Math.max(7, z.l * 0.3);
     f.chk = ch;
     UI.skill(ch);
     Audio2.sfx('check');
+  },
+  // ---------------------------------------------- 隠しボス（トリプルシャチーン）のダイヤル
+  // 針がいちばん速く、白いマスがいちばんせまい。逆回り・2つのマス・動くマス・赤いワナが重なって出る。
+  // 攻撃で予約された特別なダイヤル（噛みつき・凍る・6つの目・三つ首の同時攻撃）もここで作る。竿の守りは効かない
+  bossCheck(f) {
+    const rod = ROD_BY_ID[S.prog.rod], B = BOSS_FIGHT, P = f.phase - 1;
+    let speed = B.speed[P] + (f.bossSpd || 0);
+    if (f.bang > 0) { speed *= 1.25; f.bang--; }
+    let zl = Math.max(34, B.zone[P] + ((rod.ctrl || 0) - 9) * 2);
+    const ch = { a: 0, dir: 1, speed, zones: [], red: [], moving: 0, done: 0, hits: 0, t: 0, frozen: false, bite: false };
+    if (f.biteChk) { f.biteChk = false; ch.bite = true; ch.red = [{ s: 0, l: 360 }]; ch.speed = 260; return this.showCheck(f, ch); }
+    if (f.multiK) { const k = f.multiK; f.multiK = 0; return this.showCheck(f, this.multiCheck(f, ch, k)); }
+    const forced = f.reverse > 0;   // 雷の「次の2回は逆回り」
+    if (forced) { ch.dir = -1; f.reverse--; }
+    if (f.eyesN > 0) {
+      // 6つの目（3つの頭×2）：光った目だけが白、ほかの目は赤いワナ
+      f.eyesN--;
+      const lit = randi(0, 5);
+      for (let i = 0; i < 6; i++) { const s = 62 + i * 46; (i === lit ? ch.zones : ch.red).push({ s, l: 22 }); }
+    } else {
+      const pr = (a) => Math.random() < a[P];
+      if (!forced && pr(B.rev)) ch.dir = -1;
+      if (pr(B.dbl)) { zl *= 0.85; ch.zones.push({ s: rand(95, 160), l: zl }, { s: rand(215, 290), l: zl }); }
+      else ch.zones.push({ s: rand(115, 290), l: zl });
+      if (ch.dir < 0) for (const z of ch.zones) z.s = 360 - (z.s + z.l);
+      if (pr(B.mov)) ch.moving = rand(45, 85) * (Math.random() < 0.5 ? -1 : 1);
+      // 赤いワナ：最初のマスの手前（早押し）。第3段階は最後のマスのうしろ（おそ押し）にも
+      if (pr(B.red)) { const z = ch.zones[0]; ch.red.push({ s: ch.dir > 0 ? z.s - 36 : z.s + z.l + 6, l: 30 }); }
+      if (pr(B.red2)) { const z = ch.zones[ch.zones.length - 1]; ch.red.push({ s: ch.dir > 0 ? z.s + z.l + 8 : z.s - 38, l: 30 }); }
+    }
+    if (f.freeze > 0) { f.freeze = 0; ch.frozen = true; f.mashN = 0; UI.freeze(true); }
+    this.showCheck(f, ch);
+  },
+  // 三つ首の同時攻撃（トリプルシャチーンだけのお邪魔）：頭ごとに色のちがう針が、少しずつずれて飛んでくる。
+  // 針はそれぞれ「同じ色のマス」で止める。全部止めたら大ダメージ。1本でも失敗したら糸に傷1つ（そのダイヤルは終わり）
+  multiCheck(f, ch, k) {
+    const B = BOSS_FIGHT, P = f.phase - 1;
+    const base = B.speed[P] + (f.bossSpd || 0), zl = B.multiZone[P];
+    const cols = ['#5ae8ff', '#ffd447', '#8dff6a'];   // 左の頭・まん中の頭・右の頭
+    const dist = (a, b) => { const d = ((a - b) % 360 + 360) % 360; return Math.min(d, 360 - d); };
+    let ns = [];
+    for (let tries = 0; tries < 20; tries++) {
+      ns = [];
+      const off = rand(0, 360), heads = shuffle([0, 1, 2]).slice(0, k);
+      let launch = rand(0.2, 0.35);
+      for (const h of heads) {
+        const v = base * rand(0.8, 1.12), T = rand(0.5, 0.7), dir = Math.random() < 0.5 ? 1 : -1;
+        const a0 = off + h * 120, c = a0 + dir * v * T;   // T 秒でマスのまん中に着く
+        ns.push({ h, col: cols[h], a0, a: a0, v, dir, launch, z: { s: c - zl / 2, l: zl }, hit: false, c });
+        launch += rand(0.36, 0.5);
+      }
+      // マスどうし・マスと針のスタート位置が重なりすぎないように
+      let ok = true;
+      for (let i = 0; i < ns.length && ok; i++) for (let j = 0; j < ns.length; j++) {
+        if (i !== j && (dist(ns[i].c, ns[j].c) < zl + 6 || dist(ns[i].c, ns[j].a0) < 16)) { ok = false; break; }
+      }
+      if (ok) break;
+    }
+    ch.multi = ns; ch.zones = []; ch.red = []; ch.dir = 1; ch.speed = base;
+    return ch;
+  },
+  // 三つ首の同時攻撃のダイヤルを動かす
+  multiU(f, ch) {
+    for (const n of ch.multi) { const t = ch.t - n.launch; n.a = t > 0 ? n.a0 + n.dir * n.v * t : n.a0; n.on = t > 0; }
+    const fail = (r) => { this.result(f, r); f.chk = null; f.gap = 0.5; UI.skill(null); UI.fishMsg('三つ首に押しきられた…', '#ff5a5a', true); };
+    if (Input.isDown('fish')) {
+      let best = null, bd = 1e9;
+      for (const n of ch.multi) {
+        if (n.hit || !n.on || n.a < n.z.s || n.a > n.z.s + n.z.l) continue;
+        const d = Math.abs(n.a - (n.z.s + n.z.l / 2));
+        if (d < bd) { bd = d; best = n; }
+      }
+      if (!best) return fail('miss');
+      best.hit = true;
+      this.result(f, 'good');
+      if (ch.multi.every(n => n.hit)) {
+        f.prog += (1 / f.need) * (ch.multi.length >= 3 ? 1.6 : 0.8);   // 全部止めたらボーナス
+        f.chk = null; f.gap = 0.55; UI.skill(null);
+        UI.fishMsg(ch.multi.length >= 3 ? '三つ首を見切った！' : '二つの頭を見切った！', '#ffd447'); Audio2.sfx('great'); Cam.addShake(0.8);
+        return;
+      }
+    }
+    for (const n of ch.multi) if (!n.hit && n.on && (n.dir > 0 ? n.a > n.z.s + n.z.l + 12 : n.a < n.z.s - 12)) return fail('late');
+    UI.skillNeedle(ch);
+  },
+  // 糸をくわえて引きずりこむ（隠しボス）：時間内に決まった回数を連打。間に合わないと糸に傷1つ
+  grabU(f, dt) {
+    const g = f.grab;
+    g.t -= dt;
+    if (Input.isDown('fish')) { g.n++; Audio2.sfx('reel1'); Cam.addShake(0.3); }
+    if (g.n >= g.need) { f.grab = null; f.gap = 0.6; UI.skill(null); UI.skillResult('引きもどした！', '#7ff0f7'); Audio2.sfx('good'); return; }
+    if (g.t <= 0) {
+      f.grab = null; f.gap = 0.6; f.strain++; f.combo = 0; f.greats = 0; UI.strain(f.strain); UI.skill(null);
+      UI.skillResult('引きずりこまれた！', '#ff5a5a'); Audio2.sfx('bad'); Cam.addShake(1.4);
+      return;
+    }
+    UI.grabText(g);
   },
   evalPress(f, ch) {
     const a = ch.a;
@@ -3853,32 +3958,56 @@ const Fishing = {
     if (f.lord) LordFx.update(f, dt);
     if (f.intro > 0) {
       f.intro -= dt;   // 登場の演出中：何も出さずに待つ（演出が終わってから、少しあけて最初のダイヤル）
+    } else if (f.grab) {
+      this.grabU(f, dt);   // 隠しボス：糸をくわえて引きずりこむ（時間内に連打）
     } else if (f.final) {
       // 最後の一本釣り：ダイヤルは出さず、連打した分だけ引き上げる（外れも糸の傷もなし）
-      if (Input.isDown('fish')) {
-        f.prog += f.boss ? 1 / 36 : 1 / 30; Audio2.sfx('reel1'); Cam.addShake(0.35);
+      // 隠しボス：押し返す力がとても強い。ときどき噛みつく（「！」のあと赤い間は連打をやめる。押すと糸に傷）
+      const FB = BOSS_FIGHT.final;
+      let biting = false;
+      if (f.boss) {
+        if (f.fbite > 0) {
+          f.fbite -= dt;
+          const red = f.fbite <= FB.bite;
+          if (red && !f.fbRed) { f.fbRed = true; UI.skill({ a: 0, dir: 1, zones: [], red: [{ s: 0, l: 360 }], bite: true }); }
+          biting = red;
+          if (red && Input.isDown('fish')) {
+            f.fbite = 0; f.fbHurt = true;
+            f.strain++; f.prog = Math.max(0.75, f.prog - 0.05); UI.strain(f.strain);
+            UI.skillResult('噛みちぎられた！', '#ff5a5a'); Audio2.sfx('bad'); Cam.addShake(1.4);
+          }
+          if (f.fbite <= 0) { UI.skill(null); if (!f.fbHurt) UI.skillResult('耐えた！', '#7ff0f7'); f.fbT = rand(FB.biteGap[0], FB.biteGap[1]); }
+        } else {
+          f.fbT = (f.fbT ?? rand(FB.biteGap[0], FB.biteGap[1])) - dt;
+          if (f.fbT <= 0) { f.fbite = FB.biteWarn + FB.bite; f.fbRed = false; f.fbHurt = false; UI.fishMsg('！ 噛みつくぞ！ 手を止めろ！', '#ff5a5a', true); Audio2.sfx('growl'); Cam.addShake(1); }
+        }
+      }
+      if (!biting && Input.isDown('fish')) {
+        f.prog += f.boss ? FB.gain : 1 / 30; Audio2.sfx('reel1'); Cam.addShake(0.35);
         Particles.splash(f.pos.x + rand(-1, 1), f.pos.z + rand(-1, 1), 2);
       }
-      f.prog = Math.max(0.75, f.prog - dt * (f.boss ? 0.07 : 0.035));   // 隠しボスは押し返す力が強い（休むと戻される）
+      f.prog = Math.max(0.75, f.prog - dt * (f.boss ? FB.decay : 0.035));   // 隠しボスは押し返す力が強い（休むと戻される）
       f.mashT = (f.mashT || 0) + dt;
-      if (f.mashT > 1.4) { f.mashT = 0; UI.fishMsg('連打！', '#ffd447', true); }
+      if (f.mashT > 1.4 && !(f.fbite > 0)) { f.mashT = 0; UI.fishMsg('連打！', '#ffd447', true); }
     } else if (!f.chk) {
       f.gap -= dt;
       if (f.gap <= 0) this.newCheck(f);
     } else {
       const ch = f.chk;
       ch.t += dt;
-      if (ch.frozen) {
-        if (Input.isDown('fish')) { f.mashN++; Audio2.sfx('ice'); if (f.mashN >= (rod.bonus === 'ice' ? 4 : 8)) { ch.frozen = false; UI.freeze(false); UI.fishMsg('解凍！', '#7ff0f7', true); } }
+      if (ch.multi) {
+        this.multiU(f, ch);   // 三つ首の同時攻撃
+      } else if (ch.frozen) {
+        if (Input.isDown('fish')) { f.mashN++; Audio2.sfx('ice'); if (f.mashN >= (rod.bonus === 'ice' && !f.boss ? 4 : 8)) { ch.frozen = false; UI.freeze(false); UI.fishMsg('解凍！', '#7ff0f7', true); } }
       } else {
         ch.a += ch.dir * ch.speed * dt;
         if (ch.moving) for (const z of ch.zones) z.s = clamp(z.s + ch.moving * dt, 40, 320);
-        // 衝撃波：近づくとゾーンが飛ぶ
-        if (f.shock && !ch.shocked) { const z = ch.zones[0]; if (z && Math.abs(ch.a - z.s) < 30) { ch.shocked = true; z.s = clamp(z.s + (ch.dir > 0 ? 60 : -60), 40, 320); f.shock = false; Cam.addShake(1); } }
+        // 衝撃波：針がマスの入り口に近づくと、マスが先へ飛ぶ（逆回りのときは、上の端が入り口）
+        if (f.shock && !ch.shocked) { const z = ch.zones[0]; const edge = z ? (ch.dir > 0 ? z.s : z.s + z.l) : 0; if (z && Math.abs(ch.a - edge) < 30) { ch.shocked = true; z.s = clamp(z.s + (ch.dir > 0 ? 60 : -60), 40, 320); f.shock = false; Cam.addShake(1); } }
         const pressed = Input.isDown('fish');
         if (ch.bite) {
-          if (pressed && f.boss) {   // 隠しボス：その場では切れないが、糸が大きく傷つく（3つぶん）
-            f.strain += 3; f.combo = 0; f.greats = 0; UI.strain(f.strain); UI.skillResult('噛みちぎられた！', '#ff5a5a'); Audio2.sfx('bad'); Cam.addShake(1.4);
+          if (pressed && f.boss) {   // 隠しボス：その場では切れないが、糸が大きく傷つく（2つぶん）
+            f.strain += 2; f.combo = 0; f.greats = 0; UI.strain(f.strain); UI.skillResult('噛みちぎられた！', '#ff5a5a'); Audio2.sfx('bad'); Cam.addShake(1.4);
             f.chk = null; f.gap = 0.6; UI.skill(null);
           } else if (pressed) { this.snap('噛みつき中に巻いて、糸を切られた！'); return; }
           else if (ch.t > 1.6) { f.chk = null; f.gap = 0.3; UI.skill(null); UI.skillResult('耐えた！', '#7ff0f7'); }
@@ -3886,7 +4015,7 @@ const Fishing = {
           const r = this.evalPress(f, ch);
           this.result(f, r);
           const allHit = ch.zones.every(z => z.hit);
-          if (r !== 'good' && r !== 'great' || allHit) { f.chk = null; f.gap = (f.final ? 0.12 : f.lord ? 0.5 : 0.6) + Math.random() * 0.35; UI.skill(null); }
+          if (r !== 'good' && r !== 'great' || allHit) { f.chk = null; f.gap = f.boss ? BOSS_FIGHT.gap[0] + Math.random() * BOSS_FIGHT.gap[1] : (f.final ? 0.12 : f.lord ? 0.5 : 0.6) + Math.random() * 0.35; UI.skill(null); }
         } else {
           // 通り過ぎた
           const last = ch.dir > 0 ? Math.max(...ch.zones.filter(z => !z.hit).map(z => z.s + z.l), -1) : Math.min(...ch.zones.filter(z => !z.hit).map(z => z.s), 999);
@@ -4169,6 +4298,27 @@ function swirlTexture() {
   return _swirl;
 }
 
+// ------------------------------------------------------------------ 隠しボス（トリプルシャチーン）の強さ
+// このゲームの最後のボス。ラグナロク（針 約300〜335度/秒・白いマス 約69〜74度・糸の傷は治る）よりずっと難しくする。
+// 値は [第1段階, 第2段階, 第3段階]
+const BOSS_FIGHT = {
+  need: 12,                                   // 1段階に必要な成功の数（GREATは1.6回ぶん）
+  speed: [355, 375, 400],                     // 針の速さ（度/秒）。体当たり・地震で +12・+8（その段階のあいだ、最大 +36）
+  zone: [50, 46, 40],                         // 白いマスの広さ（度）。竿の操作性 1 につき ±2度（ワダツミ +2）
+  rev: [0.35, 0.4, 0.45], dbl: [0.3, 0.35, 0.4], mov: [0.25, 0.3, 0.35], red: [0.35, 0.4, 0.45], red2: [0, 0, 0.25],   // ワナの出やすさ（重なって出る）
+  atk: [[3.2, 4.2], [3.0, 4.0], [2.8, 3.8]],  // 攻撃の間隔（秒）
+  multiZone: [44, 40, 35],                    // 三つ首の同時攻撃のマスの広さ（度）
+  grab: { t: 2.4, need: 15 },                 // 引きずりこみ：2.4秒で15回連打
+  final: { gain: 1 / 44, decay: 0.14, biteWarn: 0.32, bite: 1.0, biteGap: [1.8, 3.0] },   // 最後の一本釣り（連打1回の力・押し返す力・噛みつきの「！」・赤い時間・間隔）
+  gap: [0.38, 0.25],                          // ダイヤルとダイヤルの間（秒）＝ 0.38 ＋ 0〜0.25
+};
+// 段階ごとの攻撃（3つの頭）。山札のように全部出しきってから、まぜ直す（今までの主・巨大生物のお邪魔を全部使う）
+const BOSS_DECKS = {
+  1: ['ram', 'bang', 'splash', 'shock', 'thunder', 'quake'],                  // 右の頭：力と速さ
+  2: ['hypno', 'flash', 'ink', 'mud', 'freeze', 'drift', 'eyes', 'twin'],     // 左の頭：まどわし
+  3: ['bite', 'grab', 'triple', 'triple', 'bite'],                            // まん中の頭：覇者（＋右と左の攻撃もまざる）
+};
+
 // ------------------------------------------------------------------ 主戦の演出と特殊攻撃（スキルチェックへの割り込み）
 const LordFx = {
   active: null,
@@ -4180,16 +4330,45 @@ const LordFx = {
     Cam.addShake(1.0);
     UI.note(`${c.data.name} が食いついた！`, 'red');
     if (c.kind === 'ragnarok') Ragnarok.eyesCut();
-    if (c.kind === 'boss') { UI.fishMsg('三つの頭が同時に食らいついた！', '#7af0ff'); UI.flash('#0a1430', 0.6, true); Audio2.sfx('roar'); Cam.addShake(2.2); UI.note('⚠ 糸の傷は治らない！ 6回失敗すると糸が切れる', 'red'); }
+    if (c.kind === 'boss') {
+      this.bossCut();
+      UI.note('⚠ 3回ミスで糸が切れる！ 糸の傷は治らない！', 'red');
+      UI.note('⚠ 竿の守り（雷よけ・氷・火山）も効かない！', 'red');
+    }
+  },
+  // 隠しボスの登場：まっ暗な中に、3つの頭の目（6つ）が順に光る
+  bossCut() {
+    const fx = $('#fx2d');
+    const d = el('div', { style: 'position:absolute;inset:0;background:#02060f;opacity:0;transition:opacity .4s;z-index:3' });
+    fx.append(d);
+    requestAnimationFrame(() => d.style.opacity = 0.94);
+    const heads = [[22, 46, '#5ae8ff'], [50, 34, '#ffd447'], [78, 46, '#8dff6a']];   // 左・まん中・右の頭 [x%, y%, 色]
+    heads.forEach(([x, y, col], i) => {
+      for (const dx of [-4.5, 4.5]) {
+        const e = el('div', { style: `position:absolute;left:${x + dx}%;top:${y}%;width:5vw;height:2.2vw;margin:-1.1vw 0 0 -2.5vw;border-radius:50%;background:radial-gradient(ellipse,#fff 0,${col} 35%,transparent 72%);box-shadow:0 0 36px 8px ${col};opacity:0;transition:opacity .3s;transform:rotate(${dx * (x < 50 ? -2 : x > 50 ? 2 : 0)}deg)` });
+        d.append(e);
+        setTimeout(() => { e.style.opacity = 1; }, 450 + i * 420);
+      }
+      setTimeout(() => { Audio2.sfx('growl'); Cam.addShake(1.2); }, 450 + i * 420);
+    });
+    setTimeout(() => { Audio2.sfx('roar'); Cam.addShake(2.4); d.append(el('div', { style: 'position:absolute;left:0;right:0;top:70%;text-align:center;font-size:46px;font-weight:900;color:#7af0ff;text-shadow:0 0 18px #000;letter-spacing:.12em' }, '海の覇者 トリプルシャチーン')); }, 1900);
+    setTimeout(() => { d.style.opacity = 0; }, 2900);
+    setTimeout(() => d.remove(), 3400);
   },
   update(f, dt) {
     const c = f.c;
     const ls = W.uni.water.uLordShadow.value;
     ls.set(f.pos.x, f.pos.z, Math.min(60, (c.data.len || 10) * 0.5), 0.6);
     if (f.intro > 0) return;   // 登場の演出中は攻撃しない
+    if (f.boss) {   // 時間で消えるお邪魔
+      if (f.driftT > 0) f.driftT -= dt;
+      f.drift = f.driftT > 0;
+      if (f.quakeT > 0) f.quakeT -= dt;
+    }
     f.nextAtk -= dt;
-    if (f.nextAtk <= 0 && !f.chk) {
-      f.nextAtk = f.boss ? rand(5, 7.5) / (1 + (f.phase - 1) * 0.3) : rand(6, 9) / (1 + (f.phase - 1) * 0.25);
+    // 攻撃はダイヤルとダイヤルの間に出す（隠しボスは、引きずりこみ中・最後の一本釣り中は出さない。最後は噛みつきで邪魔する）
+    if (f.nextAtk <= 0 && !f.chk && !(f.boss && (f.grab || f.final))) {
+      f.nextAtk = f.boss ? rand(...BOSS_FIGHT.atk[f.phase - 1]) : rand(6, 9) / (1 + (f.phase - 1) * 0.25);
       this.attack(c.data.atk || (c.kind === 'ragnarok' ? 'ragnarok' : 'splash'), f);
     }
     if (f.hypno > 0) { f.hypno -= dt; UI.hypno(f.hypno > 0); }
@@ -4218,21 +4397,44 @@ const LordFx = {
       case 'shachi': this.shachi(f); break;
     }
   },
-  // 隠しボスの攻撃（3つの頭がかわるがわる。段階が進むほど種類が増える）
+  // 隠しボスの攻撃：段階ごとの山札から順に出す（全部出しきったら、まぜ直す）。第3段階は右と左の頭の攻撃もまざる
   shachi(f) {
-    const list = ['bite', 'ram', 'wave'];
-    if (f.phase >= 2) list.push('sonic', 'bite');
-    if (f.phase >= 3) list.push('triple', 'triple');
-    const a = pick(list);
-    if (a === 'bite') { f.biteChk = true; UI.note('まん中の頭が糸に噛みつく！ 赤い間は押すな！', 'red'); Audio2.sfx('growl'); Cam.addShake(1); }
-    else if (a === 'ram') { f.diff = Math.min(4.6, f.diff + 0.1); Cam.addShake(2); Audio2.sfx('growl'); UI.note('右の頭の体当たり！ 針がさらに速くなる', 'red'); }
-    else if (a === 'wave') { UI.splashScreen(); Audio2.sfx('splashBig'); Cam.addShake(1.4); UI.note('尾びれの大波！', 'red'); }
-    else if (a === 'sonic') { f.hypno = 4; Audio2.sfx('hypno'); UI.note('左の頭の超音波…針が見えにくい！', 'red'); }
-    else { f.reverse = 2; f.bang = 2; UI.flash('#7af0ff', 0.4); Audio2.sfx('roar'); Cam.addShake(2); UI.note('三つ首の連携攻撃！ 針が速く、逆回りになる！', 'red'); }
+    if (!f.deck || !f.deck.length || f.deckPh !== f.phase) {
+      const d = BOSS_DECKS[f.phase].slice();
+      if (f.phase === 3) d.push(...shuffle(BOSS_DECKS[1].concat(BOSS_DECKS[2]).filter(a => a !== 'twin')).slice(0, 5));
+      f.deck = shuffle(d); f.deckPh = f.phase;
+    }
+    const a = f.deck.pop();
+    f.lastAtk = a;
+    const N = (t) => UI.note(t, 'red');
+    const wait = (s) => { f.gap = Math.max(f.gap || 0, s); };   // 見えなくなる攻撃のあとは、少し待ってから次のダイヤル
+    switch (a) {
+      case 'ram': f.bossSpd = Math.min(36, f.bossSpd + 12); Cam.addShake(2); Audio2.sfx('growl'); N('右の頭の体当たり！ 針がさらに速くなる！'); break;
+      case 'quake': f.bossSpd = Math.min(36, f.bossSpd + 8); f.quakeT = 4; Cam.addShake(2.4); Audio2.sfx('boom'); N('尾びれで海をたたいた！ ダイヤルがゆれる！'); break;
+      case 'bang': f.bang = 2; UI.flash('#7af0ff', 0.4); Audio2.sfx('roar'); Cam.addShake(1.6); N('三つ首の連携！ 次の2回は針がとても速い！'); break;
+      case 'splash': UI.splashScreen(); Audio2.sfx('splashBig'); Cam.addShake(1.4); wait(0.9); N('尾びれの大波！'); break;
+      case 'shock': f.shock = true; UI.flash('#ff7a2a', 0.5); Audio2.sfx('boom'); Cam.addShake(1.5); N('右の頭の衝撃波！ 次のマスが飛ぶぞ！'); break;
+      case 'thunder': Weather.bolt(Player.pos.x + rand(-10, 10), Player.pos.z + rand(-10, 10)); f.reverse = 2; wait(1.0); N('覇者の雷！ 次の2回は逆回り！'); break;
+      case 'hypno': f.hypno = 5; Audio2.sfx('hypno'); N('左の頭の超音波…針が見えにくい！'); break;
+      case 'flash': UI.flash('#ffffff', 0.95, true); Audio2.sfx('flash'); wait(0.9); N('左の頭の目くらまし！'); break;
+      case 'ink': UI.ink(); Audio2.sfx('growl'); N('黒い墨をはいた！'); break;
+      case 'mud': UI.mud(true, 6); Audio2.sfx('splashBig'); N('海の底の泥をまき上げた！'); break;   // ダイヤルの間が短いので、泥は6秒で落ちる
+      case 'freeze': f.freeze = 1; Audio2.sfx('freeze'); N('凍てつく息！ 針が凍る！ 連打で解凍！'); break;
+      case 'drift': f.driftT = 7; Audio2.sfx('roar'); N('大渦を起こした！ ダイヤルが流される！'); break;
+      case 'eyes': f.eyesN = 2; Audio2.sfx('growl'); UI.fishMsg('光った目だけを狙え！', '#ff3030', true); N('6つの目が光る！ 光った目だけを狙え！（2回）'); break;
+      case 'twin': f.multiK = 2; Audio2.sfx('roar'); Cam.addShake(1.5); wait(0.8); UI.fishMsg('同じ色のマスで止めろ！', '#7af0ff', true); N('二つの頭の同時攻撃！ 針を、それぞれ同じ色のマスで止めろ！'); break;
+      case 'triple': f.multiK = 3; Audio2.sfx('roar'); Cam.addShake(2.2); UI.flash('#7af0ff', 0.35); wait(0.9); UI.fishMsg('三つ首の同時攻撃！', '#7af0ff'); N('三つ首の同時攻撃！ 3本の針を、それぞれ同じ色のマスで止めろ！'); break;
+      case 'bite': f.biteChk = true; Audio2.sfx('growl'); Cam.addShake(1); N('まん中の頭が糸に噛みつく！ 赤い間は押すな！'); break;
+      case 'grab': f.grab = { t: BOSS_FIGHT.grab.t, n: 0, need: BOSS_FIGHT.grab.need }; UI.skill({ a: 0, dir: 1, zones: [], red: [], grab: true }); UI.grabText(f.grab); Audio2.sfx('growl'); Cam.addShake(1.6); N('まん中の頭が糸をくわえて引きずりこむ！ 連打で引きもどせ！'); break;
+    }
   },
   phase(f) {
     UI.bossPhase(f.phase);
     UI.fishMsg(`第${f.phase}段階！`, '#ff5a5a');
+    if (f.boss) {   // 頭が変わる：体当たりの速さは元にもどし、次の頭の山札にする
+      f.bossSpd = 0; f.deck = null;
+      UI.note(f.phase === 2 ? '⚠ 左の頭が目をさました！ まどわしてくるぞ！' : '⚠ まん中の頭が怒った！ 三つ首の総攻撃だ！', 'red');
+    }
     Cam.addShake(2);
     FishJump.start(f.c, f.pos, 2.2);
     Audio2.sfx('roar');
@@ -4317,6 +4519,7 @@ const UI = {
           <circle r="118" fill="rgba(10,18,48,.55)"/><circle r="104" fill="rgba(10,18,48,.88)" stroke="rgba(255,255,255,.9)" stroke-width="5"/>
           <g id="skRed"></g><g id="skZones"></g>
           <line id="skNeedle" x1="0" y1="0" x2="0" y2="-112" stroke="#ff4a4a" stroke-width="7" stroke-linecap="round"/>
+          <g id="skMulti"></g>
           <circle r="12" fill="#fff"/>
           <text id="skTxt" y="46" text-anchor="middle" fill="#fff" font-size="26" font-weight="900">TAP!</text>
         </svg><div id="skRes"></div></div>
@@ -4540,18 +4743,26 @@ const UI = {
   arcPath(a0, a1, r) {
     // 0度=12時、時計回り
     const p = (a) => { const t = (a - 90) * Math.PI / 180; return [Math.cos(t) * r, Math.sin(t) * r]; };
+    // ぐるっと1周（噛みつきの赤い輪など）：始まりと終わりが同じ点だと何も描かれないので、半分ずつ2つの弧にする
+    if (a1 - a0 >= 359.9) { const [x0, y0] = p(a0), [xm, ym] = p(a0 + 180); return `M${x0.toFixed(1)} ${y0.toFixed(1)} A${r} ${r} 0 0 1 ${xm.toFixed(1)} ${ym.toFixed(1)} A${r} ${r} 0 0 1 ${x0.toFixed(1)} ${y0.toFixed(1)}`; }
     const [x0, y0] = p(a0), [x1, y1] = p(a1);
     const large = (a1 - a0) > 180 ? 1 : 0;
     return `M${x0.toFixed(1)} ${y0.toFixed(1)} A${r} ${r} 0 ${large} 1 ${x1.toFixed(1)} ${y1.toFixed(1)}`;
   },
+  svgArc(a0, a1, color, w, r = 104) {
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('d', this.arcPath(a0, Math.max(a0 + 0.5, a1), r)); p.setAttribute('stroke', color); p.setAttribute('stroke-width', w); p.setAttribute('fill', 'none');
+    return p;
+  },
   skill(ch) {
     const wrap = $('#skillWrap');
     wrap.classList.toggle('dim', !ch);
-    const zg = $('#skZones'), rg = $('#skRed');
-    zg.innerHTML = ''; rg.innerHTML = '';
+    const zg = $('#skZones'), rg = $('#skRed'), mg = $('#skMulti');
+    zg.innerHTML = ''; rg.innerHTML = ''; mg.innerHTML = '';
+    $('#skNeedle').style.opacity = ch && (ch.multi || ch.grab) ? 0 : 1;
     if (!ch) { $('#skTxt').textContent = '…'; return; }
     const NS = 'http://www.w3.org/2000/svg';
-    const arc = (a0, a1, color, w) => { const p = document.createElementNS(NS, 'path'); p.setAttribute('d', this.arcPath(a0, Math.max(a0 + 0.5, a1), 104)); p.setAttribute('stroke', color); p.setAttribute('stroke-width', w); p.setAttribute('fill', 'none'); return p; };
+    const arc = (a0, a1, color, w) => this.svgArc(a0, a1, color, w);
     for (const r of ch.red) rg.append(arc(r.s, r.s + r.l, ch.bite ? '#ff2a2a' : '#ff4a4a', ch.bite ? 22 : 18));
     for (const z of ch.zones) {
       const g = document.createElementNS(NS, 'g');
@@ -4561,11 +4772,41 @@ const UI = {
       z.el = g;
       zg.append(g);
     }
-    $('#skTxt').textContent = ch.bite ? '押すな！' : ch.frozen ? '連打！' : 'TAP!';
-    $('#skTxt').setAttribute('fill', ch.bite ? '#ff6a6a' : '#fff');
+    // 三つ首の同時攻撃：頭ごとの色のマスと針
+    if (ch.multi) for (const n of ch.multi) {
+      const g = document.createElementNS(NS, 'g');
+      g.append(arc(n.z.s, n.z.s + n.z.l, n.col, 22));
+      n.zel = g; zg.append(g);
+      const ln = document.createElementNS(NS, 'line');
+      ln.setAttribute('x1', 0); ln.setAttribute('y1', 0); ln.setAttribute('stroke', n.col); ln.setAttribute('stroke-width', 8); ln.setAttribute('stroke-linecap', 'round');
+      n.el = ln; mg.append(ln);
+    }
+    $('#skTxt').textContent = ch.bite ? '押すな！' : ch.frozen || ch.grab ? '連打！' : ch.multi ? '同じ色！' : 'TAP!';
+    $('#skTxt').setAttribute('fill', ch.bite ? '#ff6a6a' : ch.grab ? '#ffd447' : '#fff');
     wrap.style.filter = ch.frozen ? 'hue-rotate(180deg) brightness(1.5) saturate(.5)' : '';
+    if (ch.multi) this.skillNeedle(ch);
+  },
+  // 引きずりこみ（隠しボス）：連打した数（黄色）と、のこり時間（外の赤い輪）
+  grabText(g) {
+    const zg = $('#skZones'), rg = $('#skRed');
+    zg.innerHTML = ''; rg.innerHTML = '';
+    const k = Math.min(1, g.n / g.need), tk = Math.max(0, g.t) / BOSS_FIGHT.grab.t;
+    if (k > 0) zg.append(this.svgArc(0, 359.5 * k, '#ffd447', 20));
+    if (tk > 0) rg.append(this.svgArc(0, 359.5 * tk, '#ff5a5a', 7, 120));
+    $('#skTxt').textContent = `連打！${g.n}/${g.need}`;
   },
   skillNeedle(ch) {
+    if (ch.multi) {
+      for (const n of ch.multi) {
+        if (!n.el) continue;
+        const a = n.a * Math.PI / 180;
+        n.el.setAttribute('x2', (Math.sin(a) * 112).toFixed(1));
+        n.el.setAttribute('y2', (-Math.cos(a) * 112).toFixed(1));
+        n.el.style.opacity = n.hit ? 0.25 : n.on ? 1 : 0.4;   // 飛んでくる前の針はうすく、止めた針もうすく
+        if (n.zel) n.zel.style.opacity = n.hit ? 0.3 : 1;
+      }
+      return;
+    }
     const a = ch.a * Math.PI / 180;
     const n = $('#skNeedle');
     n.setAttribute('x2', (Math.sin(a) * 112).toFixed(1));
@@ -4580,7 +4821,7 @@ const UI = {
     clearTimeout(this._sr); this._sr = setTimeout(() => { r.textContent = ''; }, 650);
   },
   strain(n) { $$('#strain i').forEach((e, i) => e.classList.toggle('on', i < n)); },
-  // 糸の傷の数（ふつうは3。隠しボスは6）
+  // 糸の傷の数（いまは隠しボスもふくめて全部3）
   strainMax(n) { const box = $('#strain'); if (!box) return; while (box.children.length < n) box.append(el('i')); while (box.children.length > n) box.lastChild.remove(); this.strain(0); },
   fightUpdate(f, dist) {
     const total = ((f.phase - 1) + Math.min(1, f.prog)) / f.phases;
@@ -4591,6 +4832,7 @@ const UI = {
     const wrap = $('#skillWrap');
     if (f.hypno > 0) { wrap.style.opacity = 0.35 + 0.35 * Math.sin(G.t * 6); wrap.style.transform = `translate(calc(-50% + ${Math.sin(G.t * 2.3) * 40}px), ${Math.cos(G.t * 1.7) * 20}px)`; }
     else if (f.drift) { wrap.style.opacity = 1; wrap.style.transform = `translate(calc(-50% + ${Math.sin(G.t * 0.9) * 160}px), ${Math.cos(G.t * 1.2) * -40}px)`; }
+    else if (f.quakeT > 0) { wrap.style.opacity = 1; wrap.style.transform = `translate(calc(-50% + ${rand(-14, 14).toFixed(1)}px), ${rand(-10, 10).toFixed(1)}px)`; }   // 地震：ダイヤルが小きざみにゆれる
     else { wrap.style.opacity = 1; wrap.style.transform = 'translateX(-50%)'; }
   },
   boss(name, phases) {
@@ -4632,7 +4874,7 @@ const UI = {
     addEventListener('pointermove', (e) => { if (on()) wipe(e); }, true);
     addEventListener('pointerdown', (e) => { if (on()) wipe(e); }, true);
   },
-  mud(on) {
+  mud(on, sec = 9) {
     const c = $('#mudLayer');
     if (!on) { c.style.display = 'none'; return; }
     c.style.display = 'block';
@@ -4645,7 +4887,7 @@ const UI = {
       x.fillStyle = g; x.beginPath(); x.arc(0, 0, 1, 0, TAU); x.fill(); x.restore();
     }
     UI.fishMsg('泥だらけ！こすって落とせ！', '#c9a467', true);
-    clearTimeout(this._mudT); this._mudT = setTimeout(() => this.mud(false), 9000);
+    clearTimeout(this._mudT); this._mudT = setTimeout(() => this.mud(false), sec * 1000);
   },
   // ------------------------------------------------ 釣り上げカード
   catchCard(c, res) {
@@ -4829,7 +5071,7 @@ const Menu = {
       el('button', { class: 'btn', onclick: () => { s.server = sv.value.trim(); Game.saveSettings(); UI.note(s.server ? 'サーバーのアドレスを保存した（タイトルにもどるとつながる）' : 'サーバーのアドレスを消した', 'gold'); } }, '保存')));
     body.append(el('h3', { style: 'margin:16px 0 8px' }, '👤 アカウント'));
     body.append(el('div', { class: 'row' }, el('div', { class: 'grow' }, el('b', {}, Accounts.cur ? `${Accounts.cur.name} でログイン中${Accounts.cur.online ? '（オンライン）' : ''}` : 'ゲストで遊んでいます'), el('div', { class: 'small' }, Accounts.cur ? 'ログアウトすると、タイトルで名前とパスワードを入れてまた開けます。' : 'タイトルの「はじめから」でアカウントをつくれます。')),
-      Accounts.cur ? el('button', { class: 'btn', onclick: async () => { if (await confirmBox('セーブしてログアウトします。よろしいですか？')) { Accounts.logout(); location.reload(); } } }, 'ログアウト') : null));
+      Accounts.cur ? el('button', { class: 'btn', onclick: async () => { if (await confirmBox('セーブしてログアウトします。よろしいですか？')) { UI.note('セーブしてログアウトしています…'); await Accounts.logout(); location.reload(); } } }, 'ログアウト') : null));
     body.append(el('h3', { style: 'margin:16px 0 8px' }, '💾 セーブ'));
     body.append(el('div', { class: 'small', style: 'margin-bottom:8px' }, Store.ok ? '自動セーブ中（30秒ごと・大事な場面）。アプリ内で保存が消えることがあるので、セーブコードを控えておくと安心です。' : 'この環境ではブラウザ保存が使えません。セーブコードを使ってください。'));
     const ta = el('textarea', { readonly: 'readonly' });
@@ -5590,6 +5832,7 @@ const Game = {
     S.player = Object.assign(S.player, data.player || {});
     if (data.world) { W.tod = data.world.tod ?? 0.12; W.day = data.world.day || 0; W.moon = data.world.moon ?? 2; W.areaWeather = data.world.weather || {}; W.event = data.world.event || null; }
     if (data.settings) Object.assign(G.settings, data.settings);
+    Net.basePt = p.playTime || 0;   // このセーブより古いデータでは、サーバーのセーブを上書きしない
     return true;
   },
   load() { try { const s = Store.get(Accounts.saveKey()); return s ? JSON.parse(s) : null; } catch (e) { return null; } },
@@ -5607,6 +5850,7 @@ const Game = {
       const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
       const data = JSON.parse(new TextDecoder().decode(bytes));
       if (!this.restore(data)) return false;
+      Net.resetNext = true;   // 自分でセーブコードを入れたときは、サーバーのセーブより古くても上書きする
       Store.set(Accounts.saveKey(), JSON.stringify(data));
       this.enterWorld(true);
       return true;
@@ -6237,7 +6481,7 @@ const Title = {
     const save = acc ? Game.load() : null;
     const hasAccounts = Accounts.list().length > 0;
     menu.replaceChildren(...[
-      acc ? el('div', { class: 'acct' }, `👤 ${acc.name} さん`, el('button', { class: 'linkbtn', onclick: go(() => { Accounts.logout(); Title.show(); }) }, 'ログアウト')) : null,
+      acc ? el('div', { class: 'acct' }, `👤 ${acc.name} さん`, el('button', { class: 'linkbtn', onclick: go(async () => { await Accounts.logout(); Title.show(); }) }, 'ログアウト')) : null,
       acc && save ? el('button', { class: 'btn gold', onclick: go(() => { Game.restore(save); t.remove(); Game.enterWorld(true); }) }, '▶ つづきから') : null,
       acc && !save ? el('button', { class: 'btn gold', onclick: go(() => Title.newGame(acc.name)) }, '🎣 この名前で冒険をはじめる') : null,
       !acc && hasAccounts ? el('button', { class: 'btn gold', onclick: go(() => Title.loginBox()) }, '🔑 ログイン') : null,
@@ -6254,9 +6498,9 @@ const Title = {
     const items = [];
     if (r && r.ok) {
       Accounts.setOnline(r.name);
-      const save = this.pickSave(r.name, r.save);
-      items.push(el('div', { class: 'acct' }, `🌐 ${r.name} さん`, el('button', { class: 'linkbtn', onclick: go(() => { Accounts.logout(); Title.show(); }) }, 'ログアウト')));
-      if (save) items.push(el('button', { class: 'btn gold', onclick: go(() => { Game.restore(save); t.remove(); Game.enterWorld(true); }) }, '▶ つづきから'));
+      const save = this.pickSave(r.name, r.save, r.bak);
+      items.push(el('div', { class: 'acct' }, `🌐 ${r.name} さん`, el('button', { class: 'linkbtn', onclick: go(async () => { menu.replaceChildren(el('div', { class: 'acct' }, 'ログアウトしています…')); await Accounts.logout(); Title.show(); }) }, 'ログアウト')));
+      if (save) items.push(el('button', { class: 'btn gold', onclick: go(() => { Game.restore(save); t.remove(); Game.enterWorld(true); this.bakNote(); }) }, '▶ つづきから'));
       else items.push(el('button', { class: 'btn gold', onclick: go(() => Title.newGame(r.name)) }, '🎣 この名前で冒険をはじめる'));
     } else {
       items.push(el('button', { class: 'btn gold', onclick: go(() => Title.netLoginBox()) }, '🔑 ログイン'));
@@ -6265,13 +6509,25 @@ const Title = {
     items.push(el('button', { class: 'btn', style: 'min-height:52px;font-size:19px', onclick: go(() => codeBox()) }, '🔑 セーブコード'));
     menu.replaceChildren(...items);
   },
-  // サーバーのセーブと、この端末の予備のセーブのうち、たくさん遊んでいる方を使う
-  pickSave(name, server) {
+  // サーバーのセーブ・サーバーの予備のセーブ・この端末の予備のセーブのうち、いちばんたくさん遊んでいるものを使う
+  // （セーブが前の状態や初期状態にもどってしまっても、予備が残っていれば元にもどる）
+  pickSave(name, server, bak) {
     let local = null;
     try { local = JSON.parse(Store.get('tt_save_net:' + name) || 'null'); } catch (e) { }
     const pt = (d) => (d && d.prog && d.prog.playTime) || 0;
-    if (local && local.prog && (!server || pt(local) > pt(server) + 5)) return local;
-    return server && server.prog ? server : null;
+    const srv = server && server.prog ? server : null;
+    let best = srv, src = null;
+    if (bak && bak.prog && pt(bak) > pt(best) + 60) { best = bak; src = 'server'; }
+    if (local && local.prog && (!best || pt(local) > pt(best) + 5)) { best = local; src = srv && pt(local) > pt(srv) + 300 ? 'local' : null; }
+    this.usedBak = src;
+    return best;
+  },
+  // 予備のセーブから元にもどしたときのお知らせ
+  bakNote() {
+    if (!this.usedBak) return;
+    const w = this.usedBak === 'server' ? 'サーバーに取っておいた予備のセーブ' : 'この端末に残っていた予備のセーブ';
+    setTimeout(() => UI.note(`💾 サーバーのセーブが前の状態にもどっていたので、${w}から元にもどしました`, 'gold'), 1500);
+    this.usedBak = null;
   },
   netCreateBox() {
     this.form('🎣 オンラインのアカウントをつくる', [
@@ -6307,9 +6563,9 @@ const Title = {
       if (!r.ok) return r.msg;
       Accounts.setOnline(r.name);
       Audio2.sfx('fanfare');
-      const save = this.pickSave(r.name, r.save);
+      const save = this.pickSave(r.name, r.save, r.bak);
       const tt = $('#title'); if (tt) tt.remove();
-      if (save && Game.restore(save)) Game.enterWorld(true);
+      if (save && Game.restore(save)) { Game.enterWorld(true); this.bakNote(); }
       else Title.newGame(r.name);
       return null;
     });
@@ -6317,6 +6573,7 @@ const Title = {
   // 新しく冒険をはじめる（キャラメイクへ）
   newGame(name) {
     S.prog = newProg();
+    Net.basePt = 0;
     S.player.look = Object.assign({}, DEFAULT_LOOK, { name: name || DEFAULT_LOOK.name });
     const t = $('#title'); if (t) t.remove();
     CharMake.open(true);
@@ -7143,9 +7400,15 @@ const Accounts = {
     Store.set('tt_session', a.key);
     return null;
   },
-  logout() {
-    if (G.mode === 'play') Game.save();
-    if (this.cur && this.cur.online) { Net.save(Game.snapshot(), true); Net.logout(); }
+  async logout() {
+    const playing = G.mode === 'play';
+    if (playing) Game.save();
+    if (this.cur && this.cur.online) {
+      // サーバーへのセーブは、ゲームを遊んでいるときだけ。タイトル画面（まだ「つづきから」を押していない）で送ると、
+      // まっさらなデータでサーバーのセーブを上書きしてしまう（アカウントが初期状態にもどる不具合の原因だった）
+      if (playing) Net.save(Game.snapshot(), true);
+      await Net.logout();   // セーブの書きこみとログアウトが終わるまで待つ
+    }
     else Store.del('tt_session');
     this.cur = null;
   },
@@ -7526,10 +7789,18 @@ const Net = {
     if (!r.ok) return { ok: false, msg: r.msg || 'ログインできなかった' };
     this.authed = true; this.name = r.name; this.wasOnline = true;
     Store.set(this.tokenKey(), r.token);
-    let save = null; try { save = r.save ? JSON.parse(r.save) : null; } catch (e) { }
-    return { ok: true, name: r.name, save };
+    let save = null, bak = null;
+    try { save = r.save ? JSON.parse(r.save) : null; } catch (e) { }
+    try { bak = r.bak ? JSON.parse(r.bak) : null; } catch (e) { }   // サーバーの予備のセーブ（いまのセーブより、たくさん遊んでいたとき）
+    return { ok: true, name: r.name, save, bak };
   },
-  logout() { const t = Store.get(this.tokenKey()); if (t) this.send('logout', { token: t }); Store.del(this.tokenKey()); this.authed = false; this.inWorld = false; this.wasOnline = false; },
+  // ログアウト：サーバーが前のセーブを書き終えて、ログアウトするまで待つ（3秒まで）
+  async logout() {
+    const t = Store.get(this.tokenKey());
+    Store.del(this.tokenKey());
+    if (t) await this.ask('logout', { token: t }, 3000);
+    this.authed = false; this.inWorld = false; this.wasOnline = false;
+  },
   // ---------------------------------------------- セーブ・入室・位置
   summary() {
     const p = S.prog;
@@ -7545,10 +7816,15 @@ const Net = {
   },
   save(snap, force) {
     if (!this.on) return;
+    // 読みこんだセーブより「ずっと遊んでいない」データ（まっさらなデータ・古いデータ）では、サーバーのセーブを上書きしない
+    const pt = (snap && snap.prog && snap.prog.playTime) || 0;
+    if (pt + 60 < (this.basePt || 0)) { console.warn('[save] 読みこんだセーブより古いので送らない', Math.round(pt), Math.round(this.basePt)); return; }
     const t = performance.now();
     if (!force && t - this.saveT < 8000) { this.savePend = true; return; }
     this.saveT = t; this.savePend = false;
-    this.send('save', { data: JSON.stringify(snap), sum: this.summary() });
+    const m = { data: JSON.stringify(snap), sum: this.summary() };
+    if (this.resetNext) { m.reset = 1; this.resetNext = false; }   // セーブコードを読みこんだとき：古いセーブでも上書きしてよい
+    this.send('save', m);
   },
   join() {
     if (!this.on || this.inWorld || G.mode !== 'play') return;
@@ -9125,23 +9401,31 @@ class FbLink {
     }
     if (this.dead) return;
     this.uid = uid; this.name = u.name; this.kicked = false;
+    // セーブの守り：いまのセーブと予備のセーブの「遊んだ時間」を調べる
+    const ptOf = (s) => { if (typeof s !== 'string') return -1; try { return Number(((JSON.parse(s) || {}).prog || {}).playTime) || 0; } catch (e) { return -1; } };
+    const sPt = ptOf(u.save), bPt = ptOf(u.bak);
+    this.srvPt = Math.max(0, sPt);   // これより「ずっと遊んでいない」データでは上書きしない（h_save）
+    // 予備のセーブ：ログインしたときのセーブのうち、いちばん遊んだものを取っておく（セーブが初期状態や前の状態にもどっても、元にもどせるように）
+    if (sPt >= 0 && sPt > bPt) await this.wr(this.ad.update('users/' + uid, { bak: u.save, bakT: FB_TS }), true);
+    const bak = bPt > sPt + 60 ? u.bak : null;   // 予備の方がたくさん遊んでいたら、ゲームに渡して元にもどす
     this.sid = Math.random().toString(36).slice(2, 12);
     await this.wr(this.ad.set('users/' + uid + '/sid', this.sid));
     this.unSid();
     this.sidUn = this.ad.listen('users/' + uid + '/sid', 'value', v => { if (this.uid === uid && v && v !== this.sid) this.kick('ほかの場所で同じアカウントにログインしたので、こちらは切断しました'); }, null, e => { if (this.uid === uid) Fb.err('listen sid', e); });
     this.presence();
-    this.reply(m, { t: 'auth', ok: 1, name: u.name, token: 'fb', save: typeof u.save === 'string' ? u.save : null });
+    this.reply(m, { t: 'auth', ok: 1, name: u.name, token: 'fb', save: typeof u.save === 'string' ? u.save : null, bak });
   }
   unSid() { if (this.sidUn) { try { this.sidUn(); } catch (e) { } this.sidUn = null; } }
   presence() { if (!this.uid) return; const p = 'online/' + this.uid; this.wr(this.ad.onDisc(p, 'remove')); this.wr(this.ad.set(p, true)); }
-  async h_logout() {
+  async h_logout(m) {
     await this.leaveWorld();
     if (this.saveP) await this.saveP;
     const uid = this.uid;
     this.unSid();
-    this.uid = null; this.name = null;
+    this.uid = null; this.name = null; this.srvPt = 0; this.dexKey = null;
     if (uid) { await this.wr(this.ad.cancelDisc('online/' + uid), true); await this.wr(this.ad.remove('online/' + uid), true); }
     await this.wr(this.ad.signOut());
+    this.reply(m, { t: 'bye' });   // ゲーム側は、これが来るまで待ってから画面を切りかえる
   }
   kick(msg) {
     if (this.kicked || this.dead) return;
@@ -9162,8 +9446,12 @@ class FbLink {
     up['pub/' + uid] = { name: this.name, money: Math.floor(fbNum(s.money, 0, 0, 1e15)), best_len: fbNum(b.len, 0, 0, 1000), best_kind: String(b.kind || '').slice(0, 12), best_id: String(b.id || '').slice(0, 40),
       best_name: String(b.name || '').slice(0, 40), best_gold: b.gold ? 1 : 0, dexn: Math.floor(fbNum(s.dexn, 0, 0, 9999)), title, t: FB_TS,
       price_val: Math.floor(fbNum(pb.price, 0, 0, 1e15)), price_kind: String(pb.kind || '').slice(0, 12), price_id: String(pb.id || '').slice(0, 40), price_name: String(pb.name || '').slice(0, 40), price_gold: pb.gold ? 1 : 0 };
-    let dex = null, total = 0;
-    try { const prog = JSON.parse(m.data).prog || {}; dex = JSON.stringify(prog.dex || {}); total = Math.floor(fbNum(prog.total, 0, 0, 1e9)); } catch (e) { }
+    let dex = null, total = 0, pt = 0;
+    try { const prog = JSON.parse(m.data).prog || {}; dex = JSON.stringify(prog.dex || {}); total = Math.floor(fbNum(prog.total, 0, 0, 1e9)); pt = Number(prog.playTime) || 0; } catch (e) { }
+    // いまサーバーにあるセーブより「ずっと遊んでいない」データ（まっさらなデータ・古いタブのデータ）では上書きしない。
+    // 自分でセーブコードを読みこんだとき（reset）だけは、古くても上書きする
+    if (!m.reset && pt + 60 < (this.srvPt || 0)) { Fb.err('save', `古いセーブなので上書きしない（${Math.round(pt)}秒 < ${Math.round(this.srvPt)}秒）`); return; }
+    this.srvPt = m.reset ? pt : Math.max(this.srvPt || 0, pt);
     const look = JSON.stringify(s.look || {}).slice(0, 3000);
     const key = dex + '|' + total + '|' + look + '|' + title;
     if (dex && key !== this.dexKey) { this.dexKey = key; up['dex/' + uid] = { name: this.name, dex, total, look, title }; }
@@ -10093,7 +10381,7 @@ G.onKey = (code) => {
 
 // ---- 99_boot.js
 // テスト用の窓口（ゲームには影響しない）
-window.__TT = { G, W, S, Game, Player, Boat, Fishing, Cam, Input, UI, Menu, Story, Clock, Assets, Shadows, Debug, Fish, FISH_BY_ID, LORDS, Ground, Solid, MAPDATA, NPCs, Shop, Quests, Interact, Store, GoldZone, Legend, Aquarium, ShowOff, CatchFx, Accounts, sha256hex, CatchShow, Title, Net, Others, Chat, Social, Tour, Trade, Prank, Ride, Online, Skins, Gacha, Thumbs, SKINS, Preview, Clock, Dex, Dark, AREAS, Fb, FbLink, Paradise, PARADISE, LEGEND, Mixers, makeCatchObj, Particles, STORM_WALL, OUTPOST, BOSS, BOSS_SPOT, Spots, areaAt, FISH, BAIT_BY_ID, DEX_ALL, LordFx, waveH, OnlineEv, step(n = 1, dt = 1 / 30) { for (let i = 0; i < n; i++) frameStep(dt); } };
+window.__TT = { G, W, S, Game, Player, Boat, Fishing, Cam, Input, UI, Menu, Story, Clock, Assets, Shadows, Debug, Fish, FISH_BY_ID, LORDS, Ground, Solid, MAPDATA, NPCs, Shop, Quests, Interact, Store, GoldZone, Legend, Aquarium, ShowOff, CatchFx, Accounts, sha256hex, CatchShow, Title, Net, Others, Chat, Social, Tour, Trade, Prank, Ride, Online, Skins, Gacha, Thumbs, SKINS, Preview, Clock, Dex, Dark, AREAS, Fb, FbLink, Paradise, PARADISE, LEGEND, Mixers, makeCatchObj, Particles, STORM_WALL, OUTPOST, BOSS, BOSS_SPOT, Spots, areaAt, FISH, BAIT_BY_ID, DEX_ALL, LordFx, waveH, OnlineEv, Audio2, FishJump, Weather, Ragnarok, RAGNAROK, BOSS_FIGHT, BOSS_DECKS, ROD_BY_ID, step(n = 1, dt = 1 / 30) { for (let i = 0; i < n; i++) frameStep(dt); } };
 // 起動（すべての定義が終わってから）
 boot().catch(e => { console.error(e); const l = $('#loadTxt'); if (l) l.textContent = 'エラー: ' + e.message; });
 
